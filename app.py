@@ -2963,7 +2963,6 @@ elif menu == "⚙️ Configuración de Análisis":
     
     with t_det:
         st.subheader("Crear / Modificar Renglón de Análisis")
-        # 1. Agregamos "form" y "es_edicion" al estado inicial
         if "det_state" not in st.session_state: 
             st.session_state.det_state = {"cod": "", "nom": "", "uni": "", "ref": "", "tit": "No", "ub_f": 0.0, "form": "", "es_edicion": False}
         
@@ -2974,7 +2973,6 @@ elif menu == "⚙️ Configuración de Análisis":
             with col3: es_t = st.selectbox("¿Es solo un Título?", ["No", "Si"], index=0 if st.session_state.det_state["tit"]=="No" else 1)
             with col3_ub: ub_fac_input = st.number_input("U.B. Facturación:", min_value=0.0, value=st.session_state.det_state["ub_f"])
             
-            # 2. Distribución de columnas (Unidad, Fórmula, Límites)
             col4, col_formula, col5 = st.columns([2,4,4])
             with col4: u_m = st.text_input("Unidad", value=st.session_state.det_state["uni"])
             with col_formula: f_m = st.text_input("Fórmula Matemática (Opcional)", value=st.session_state.det_state["form"], placeholder="Ej: (HT_02 * 10) / GR_01")
@@ -2983,8 +2981,6 @@ elif menu == "⚙️ Configuración de Análisis":
             if st.form_submit_button("💾 Guardar Renglón"):
                 if c_i and s_n:
                     conn = conectar_db(); cur = conn.cursor()
-
-                    # 🔍 VALIDACIÓN: Comprobar si el código existe si NO estamos en modo edición
                     es_edicion_actual = st.session_state.det_state.get("es_edicion", False)
                     if not es_edicion_actual:
                         cur.execute("SELECT 1 FROM determinaciones WHERE codigo_item = ?", (c_i,))
@@ -2994,7 +2990,6 @@ elif menu == "⚙️ Configuración de Análisis":
                             conn.close()
                             st.stop()
 
-                    # 🛠️ PARCHE AUTOMÁTICO: Le agrega la columna a la base de datos si le falta
                     try: cur.execute("ALTER TABLE determinaciones ADD COLUMN formula_calculo TEXT")
                     except: pass 
 
@@ -3005,13 +3000,11 @@ elif menu == "⚙️ Configuración de Análisis":
                     """, (c_i, s_n, u_m, r_f, es_t, ub_fac_input, f_m))
                     
                     conn.commit(); conn.close()
-                    # Limpiamos el estado incluyendo el flag de edición
                     st.session_state.det_state = {"cod": "", "nom": "", "uni": "", "ref": "", "tit": "No", "ub_f": 0.0, "form": "", "es_edicion": False}
                     st.success("Guardado correctamente."); st.rerun()
                 else:
                     st.warning("⚠️ Por favor completa el Código Ítem y el Nombre.")
                     
-        # Listado para desempaquetar la fórmula y marcar el estado de edición al hacer clic en ✏️
         for fila_det in listar_todas_determinaciones():
             cod = fila_det[0]
             nom = fila_det[1]
@@ -3025,7 +3018,6 @@ elif menu == "⚙️ Configuración de Análisis":
             with col_a: st.write(f"**`{cod}`** — {nom}")
             with col_c:
                 if st.button("✏️", key=f"ed_det_{cod}"): 
-                    # Se habilita 'es_edicion': True para permitir la actualización sobre el mismo código
                     st.session_state.det_state = {"cod": cod, "nom": nom, "uni": uni, "ref": ref, "tit": tit, "ub_f": ub_f, "form": form, "es_edicion": True}
                     st.rerun()
             with col_d:
@@ -3175,29 +3167,29 @@ elif menu == "⚙️ Configuración de Análisis":
                             st.rerun()
 
                 actuales = obtener_sub_items_de_practica(p_sel)
-            for v_id, c_i, s_n, _, _, _, _, o, met, neg, _ in actuales:
-                col_x, col_z = st.columns([8, 1])
-                
-                with col_x: 
-                    st.write(f"**Posición {o}** | `{c_i}` — **{s_n}** " + (f"*(Técnica: {met})*" if met else ""))
-                
-                with col_z:
-                    col_edit, col_del = st.columns(2)
+                for v_id, c_i, s_n, _, _, _, _, o, met, neg, _ in actuales:
+                    col_x, col_z = st.columns([8, 1])
                     
-                    with col_edit:
-                        if st.button("✏️", key=f"edit_v_{v_id}", help="Editar esta vinculación"):
-                            st.session_state.enlace_id_a_editar = v_id
-                            st.session_state.modo_edicion_enlace = True
-                            st.rerun()
-                            
-                    with col_del:
-                        if st.button("❌", key=f"del_v_{v_id}", help="Eliminar esta vinculación"): 
-                            conn = conectar_db()
-                            cur = conn.cursor()
-                            cur.execute("DELETE FROM perfil_detalles WHERE id = ?", (v_id,))
-                            conn.commit()
-                            conn.close()
-                            st.rerun()
+                    with col_x: 
+                        st.write(f"**Posición {o}** | `{c_i}` — **{s_n}** " + (f"*(Técnica: {met})*" if met else ""))
+                    
+                    with col_z:
+                        col_edit, col_del = st.columns(2)
+                        
+                        with col_edit:
+                            if st.button("✏️", key=f"edit_v_{v_id}", help="Editar esta vinculación"):
+                                st.session_state.enlace_id_a_editar = v_id
+                                st.session_state.modo_edicion_enlace = True
+                                st.rerun()
+                                
+                        with col_del:
+                            if st.button("❌", key=f"del_v_{v_id}", help="Eliminar esta vinculación"): 
+                                conn = conectar_db()
+                                cur = conn.cursor()
+                                cur.execute("DELETE FROM perfil_detalles WHERE id = ?", (v_id,))
+                                conn.commit()
+                                conn.close()
+                                st.rerun()
 
     with t_os:
         st.subheader("💵 Registro y Ajuste de Obras Sociales (UB)")
@@ -3295,6 +3287,112 @@ elif menu == "⚙️ Configuración de Análisis":
                 if st.button("🗑️", key=f"del_os_{os_id}"): 
                     conn = conectar_db(); cur = conn.cursor()
                     cur.execute("DELETE FROM obras_sociales WHERE id = ?", (os_id,))
+                    conn.commit(); conn.close()
+                    st.rerun()
+
+    with t_med:
+        st.subheader("👨‍⚕️ Gestión de Médicos Solicitantes")
+        if "med_state" not in st.session_state:
+            st.session_state.med_state = {"id": None, "nombre": "", "matricula": ""}
+            
+        with st.form("form_medicos", clear_on_submit=True):
+            m_nom = st.text_input("Nombre y Apellido del Dr./a:", value=st.session_state.med_state["nombre"])
+            m_mat = st.text_input("Matrícula Profesional (Opcional):", value=st.session_state.med_state["matricula"])
+            
+            btn_save_med = st.form_submit_button("💾 Guardar Médico")
+            
+        if btn_save_med and m_nom:
+            conn = conectar_db(); cur = conn.cursor()
+            # Creamos la tabla médicos por seguridad si no existiera
+            cur.execute("""CREATE TABLE IF NOT EXISTS medicos (id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT, matricula TEXT)""")
+            
+            if st.session_state.med_state["id"]:
+                cur.execute("UPDATE medicos SET nombre = ?, matricula = ? WHERE id = ?", (m_nom.upper(), m_mat, st.session_state.med_state["id"]))
+            else:
+                cur.execute("INSERT INTO medicos (nombre, matricula) VALUES (?, ?)", (m_nom.upper(), m_mat))
+            conn.commit(); conn.close()
+            st.session_state.med_state = {"id": None, "nombre": "", "matricula": ""}
+            st.success("Médico guardado correctamente.")
+            st.rerun()
+        elif btn_save_med:
+            st.warning("⚠️ Debe ingresar al menos el nombre del médico.")
+            
+        st.markdown("---")
+        st.markdown("##### Médicos Registrados")
+        try:
+            conn = conectar_db(); cur = conn.cursor()
+            cur.execute("CREATE TABLE IF NOT EXISTS medicos (id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT, matricula TEXT)")
+            cur.execute("SELECT id, nombre, matricula FROM medicos ORDER BY nombre ASC")
+            medicos_db = cur.fetchall()
+            conn.close()
+        except:
+            medicos_db = []
+            
+        for m_id, m_nombre, m_matricula in medicos_db:
+            col_m1, col_m2, col_m3 = st.columns([6, 1, 1])
+            with col_m1:
+                mat_txt = f" (Mat: {m_matricula})" if m_matricula else ""
+                st.write(f"• **{m_nombre}**{mat_txt}")
+            with col_m2:
+                if st.button("✏️", key=f"ed_med_{m_id}"):
+                    st.session_state.med_state = {"id": m_id, "nombre": m_nombre, "matricula": m_matricula if m_matricula else ""}
+                    st.rerun()
+            with col_m3:
+                if st.button("🗑️", key=f"del_med_{m_id}"):
+                    conn = conectar_db(); cur = conn.cursor()
+                    cur.execute("DELETE FROM medicos WHERE id = ?", (m_id,))
+                    conn.commit(); conn.close()
+                    st.rerun()
+
+    with t_resp:
+        st.subheader("✍️ Respuestas / Comentarios Fijos para Informes")
+        if "resp_state" not in st.session_state:
+            st.session_state.resp_state = {"id": None, "titulo": "", "texto": ""}
+            
+        with st.form("form_respuestas", clear_on_submit=True):
+            r_titulo = st.text_input("Título Corto de la Respuesta Fija:", value=st.session_state.resp_state["titulo"])
+            r_texto = st.text_area("Contenido / Texto Fijo:", value=st.session_state.resp_state["texto"])
+            
+            btn_save_resp = st.form_submit_button("💾 Guardar Respuesta Fija")
+            
+        if btn_save_resp and r_titulo and r_texto:
+            conn = conectar_db(); cur = conn.cursor()
+            cur.execute("""CREATE TABLE IF NOT EXISTS respuestas_fijas (id INTEGER PRIMARY KEY AUTOINCREMENT, titulo TEXT, texto TEXT)""")
+            
+            if st.session_state.resp_state["id"]:
+                cur.execute("UPDATE respuestas_fijas SET titulo = ?, texto = ? WHERE id = ?", (r_titulo.upper(), r_texto, st.session_state.resp_state["id"]))
+            else:
+                cur.execute("INSERT INTO respuestas_fijas (titulo, texto) VALUES (?, ?)", (r_titulo.upper(), r_texto))
+            conn.commit(); conn.close()
+            st.session_state.resp_state = {"id": None, "titulo": "", "texto": ""}
+            st.success("Respuesta fija guardada con éxito.")
+            st.rerun()
+        elif btn_save_resp:
+            st.warning("⚠️ Debe completar tanto el título corto como el contenido de la respuesta.")
+            
+        st.markdown("---")
+        st.markdown("##### Respuestas Fijas Registradas")
+        try:
+            conn = conectar_db(); cur = conn.cursor()
+            cur.execute("CREATE TABLE IF NOT EXISTS respuestas_fijas (id INTEGER PRIMARY KEY AUTOINCREMENT, titulo TEXT, texto TEXT)")
+            cur.execute("SELECT id, titulo, texto FROM respuestas_fijas ORDER BY titulo ASC")
+            resp_db = cur.fetchall()
+            conn.close()
+        except:
+            resp_db = []
+            
+        for r_id, r_tit, r_txt in resp_db:
+            col_r1, col_r2, col_r3 = st.columns([6, 1, 1])
+            with col_r1:
+                st.write(f"• **{r_tit}**: _{r_txt[:60]}..._")
+            with col_r2:
+                if st.button("✏️", key=f"ed_resp_{r_id}"):
+                    st.session_state.resp_state = {"id": r_id, "titulo": r_tit, "texto": r_txt}
+                    st.rerun()
+            with col_r3:
+                if st.button("🗑️", key=f"del_resp_{r_id}"):
+                    conn = conectar_db(); cur = conn.cursor()
+                    cur.execute("DELETE FROM respuestas_fijas WHERE id = ?", (r_id,))
                     conn.commit(); conn.close()
                     st.rerun()
 
