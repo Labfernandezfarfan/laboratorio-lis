@@ -743,33 +743,56 @@ def buscar_ordenes_todas():
         ORDER BY o.id DESC
     """)
     res = c.fetchall(); conn.close(); return res
-def obtener_historial_paciente_item(nombre_paciente, codigo_item, orden_id_actual):
+def obtener_historial_paciente_item(paciente_id, nombre_paciente, codigo_item, orden_id_actual, limite=10):
     """
-    Busca los resultados anteriores del paciente cruzando la tabla pacientes (p),
-    excluyendo la orden actual y requiriendo que esté Validada.
+    Recupera TODOS los antecedentes de análisis anteriores para este ítem y paciente.
     """
+    if not codigo_item:
+        return []
+
     conn = conectar_db()
     cur = conn.cursor()
-    # Hacemos el JOIN con la tabla pacientes (p) para poder usar p.nombre
-    cur.execute("""
-        SELECT o.fecha, ri.resultado, ri.unidad
+    historial = []
+
+    # Consulta que busca TODOS los resultados de órdenes anteriores a la actual
+    query = """
+        SELECT 
+            o.fecha, 
+            ri.resultado, 
+            ri.unidad, 
+            o.id AS nro_protocolo
         FROM resultados_items ri
         JOIN ordenes o ON ri.orden_id = o.id
-        JOIN pacientes p ON o.paciente_id = p.id
-        WHERE p.nombre = ? 
-          AND ri.codigo_item = ? 
-          AND o.id != ?
-          AND o.estado = 'Validada'
-          AND ri.resultado != ''
-          AND ri.resultado IS NOT NULL
-        ORDER BY o.id DESC
-    """, (nombre_paciente, codigo_item, orden_id_actual))
-    res = cur.fetchall()
-    conn.close()
-    return res
+        LEFT JOIN pacientes p ON o.paciente_id = p.id
+        WHERE (o.paciente_id = ? OR (p.nombre IS NOT NULL AND LOWER(TRIM(p.nombre)) = LOWER(TRIM(?))))
+          AND (TRIM(UPPER(ri.codigo_item)) = TRIM(UPPER(?)) OR TRIM(UPPER(ri.sub_item)) = TRIM(UPPER(?)))
+          AND CAST(o.id AS INT) < CAST(? AS INT)
+          AND ri.resultado IS NOT NULL 
+          AND TRIM(CAST(ri.resultado AS TEXT)) != ''
+        ORDER BY CAST(o.id AS INT) DESC
+        LIMIT ?
+    """
+
+    try:
+        cur.execute(query, (
+            paciente_id, 
+            str(nombre_paciente).strip(), 
+            str(codigo_item).strip(), 
+            str(codigo_item).strip(), 
+            orden_id_actual, 
+            limite
+        ))
+        historial = cur.fetchall()
+    except Exception as e:
+        print(f"Error al obtener historial: {e}")
+        historial = []
+    finally:
+        conn.close()
+
+    return historial
 def obtener_items_para_cargar(orden_id):
     conn = conectar_db(); c = conn.cursor()
-    # 🚀 Traemos la fórmula en tiempo real desde la tabla madre "determinaciones" (d.formula_calculo)
+    # 🚀 Traemos la fórmula en tiempo real y agregamos 'es_particular'
     c.execute("""
         SELECT 
             ri.id, 
@@ -784,7 +807,8 @@ def obtener_items_para_cargar(orden_id):
             ri.metodo, 
             ri.en_negrita, 
             ri.ub_facturacion, 
-            ri.orden_visual 
+            ri.orden_visual,
+            COALESCE(ri.es_particular, 0) AS es_particular -- 👈 Agregado clave (posición 13 / índice 13 o -1)
         FROM resultados_items ri
         LEFT JOIN determinaciones d ON ri.codigo_item = d.codigo_item
         WHERE ri.orden_id = ? 
@@ -794,6 +818,7 @@ def obtener_items_para_cargar(orden_id):
 
 crear_tablas()
 
+# --- MENÚ DEL SISTEMA (UNIFICADO) ---
 # --- MENÚ DEL SISTEMA (UNIFICADO) ---
 opciones_menu = [
     "📋 Recepción de Pacientes", 
@@ -806,7 +831,11 @@ opciones_menu = [
 ]
 
 if st.session_state.rol == "administrador":
-    opciones_menu.extend(["💵 Facturación Obras Sociales", "⚙️ Configuración de Análisis"])
+    opciones_menu.extend([
+        "💵 Facturación Obras Sociales", 
+        "💵 Facturación Particulares",  # 👈 NUEVA OPCIÓN AGREGADA AQUÍ
+        "⚙️ Configuración de Análisis"
+    ])
 
 with st.sidebar:
     st.markdown("### 🖥️ Módulos del LIS")
@@ -1246,15 +1275,15 @@ elif menu == "🛒 Carga de Protocolos":
             st.markdown("---")
             
             # ==========================================
-            # DETECTAR O INICIALIZAR LA LISTA EN MEMORIA DESDE EL NOMENCLADOR
+            # DETECTAR O INICIALIZAR LA LISTA EN MEMORIA
             # ==========================================
             if "perfiles_seleccionados" not in st.session_state:
-                st.session_state.perfiles_seleccionados = []
+                st.session_state.perfiles_seleccionados = []  # Guardará diccionarios: {'perfil': p, 'es_particular': False}
 
             st.subheader("🔬 Selección de Prácticas y Perfiles")
 
-            # 1. CUADRO AMARILLO DE BÚSQUEDA INTERACTIVA (Reemplazó al multiselect viejo)
-            perf_lista = listar_nomenclador() # Tu función real que trae los perfiles
+            # Búsqueda interactiva de perfiles
+            perf_lista = listar_nomenclador()
             
             perfil_buscado = st.selectbox(
                 "Buscar y Agregar los Perfiles de Análisis en la Orden:", 
@@ -1263,27 +1292,51 @@ elif menu == "🛒 Carga de Protocolos":
                 key="buscador_perfiles_input"
             )
 
-            # Botón para añadir el perfil elegido a la lista móvil
+            # Botón para añadir el perfil elegido a la lista
             if st.button("➕ Añadir Perfil al Protocolo", use_container_width=True):
-                # Validamos que no se duplique en la lista visual
-                if perfil_buscado not in st.session_state.perfiles_seleccionados:
-                    st.session_state.perfiles_seleccionados.append(perfil_buscado)
+                # Validamos que no se duplique buscando por el código (perfil_buscado[0])
+                codigos_actuales = [p['perfil'][0] for p in st.session_state.perfiles_seleccionados]
+                if perfil_buscado[0] not in codigos_actuales:
+                    # Guardamos la práctica en formato Diccionario junto con la bandera 'es_particular'
+                    st.session_state.perfiles_seleccionados.append({
+                        'perfil': perfil_buscado,
+                        'es_particular': False  # Por defecto no es particular (lo cubre OS)
+                    })
                     st.rerun()
 
             st.markdown("---")
 
             # ===================================================
-            # 2. INTERFAZ GRÁFICA CON FLECHAS EN PARALELO (IGUAL A TU FOTO)
+            # INTERFAZ CON REORDENAMIENTO Y TILDE PARTICULAR
             # ===================================================
             if st.session_state.perfiles_seleccionados:
                 col_lista, col_botones = st.columns([0.75, 0.25])
                 
                 with col_lista:
+                    st.write("📋 **Perfiles incluidos en la orden actual:**")
+                    
+                    # Recorremos los perfiles agregados para dibujarlos con su checkbox individual
+                    for idx, item in enumerate(st.session_state.perfiles_seleccionados):
+                        c_codigo = item['perfil'][0]
+                        c_nombre = item['perfil'][1]
+                        
+                        col_txt, col_chk = st.columns([0.65, 0.35])
+                        with col_txt:
+                            st.markdown(f"**{idx + 1}. ({c_codigo}) — {c_nombre}**")
+                        with col_chk:
+                            # 🟡 CHECKBOX CLAVE: Tilde para marcar como Particular / Cobro Paciente
+                            item['es_particular'] = st.checkbox(
+                                "💵 Paga Paciente (Particular)", 
+                                value=item['es_particular'], 
+                                key=f"particular_chk_{c_codigo}_{idx}"
+                            )
+                        st.markdown("<hr style='margin: 3px 0;'>", unsafe_allow_html=True)
+
                     opciones_radio = range(len(st.session_state.perfiles_seleccionados))
                     perfil_index_sel = st.radio(
-                        "📋 Perfiles incluidos en la orden actual (Seleccione uno para mover o quitar):", 
+                        "Seleccione un perfil si desea moverlo de lugar o quitarlo:", 
                         options=opciones_radio,
-                        format_func=lambda i: f"({st.session_state.perfiles_seleccionados[i][0]}) — {st.session_state.perfiles_seleccionados[i][1]}"
+                        format_func=lambda i: f"({st.session_state.perfiles_seleccionados[i]['perfil'][0]}) — {st.session_state.perfiles_seleccionados[i]['perfil'][1]}"
                     )
 
                 with col_botones:
@@ -1313,62 +1366,105 @@ elif menu == "🛒 Carga de Protocolos":
 
             st.markdown("---")
 
-
-            # ===================================================
-            # 3. BOTÓN DE GUARDADO CON ALERTA Y LIMPIEZA DE PANTALLA
+                        # ===================================================
+            # BOTÓN DE GUARDADO CORREGIDO
             # ===================================================
             if st.button("🚀 Crear Protocolo Médico", type="primary", use_container_width=True):
                 if not st.session_state.perfiles_seleccionados:
                     st.error("❌ Error: Debe agregar al menos un perfil de análisis a la lista interactiva antes de guardar.")
                 else:
-                    # 1. Registramos la orden madre usando tu función original
-                    lista_ids_ordenados = [p[0] for p in st.session_state.perfiles_seleccionados]
+                    lista_ids_ordenados = [item['perfil'][0] for item in st.session_state.perfiles_seleccionados]
+                    
+                    # 1. Registramos la orden base
                     orden_id = registrar_orden(proto_man, p_sel, m_sel, o_sel, bq_sel, tipo_p_sel, nro_ord_int, lista_ids_ordenados, fecha_para_guardar)
                     
                     if orden_id:
-                        # 2. REORDENAMIENTO INTERNO EN LA BASE DE DATOS
-                        conn = conectar_db(); c = conn.cursor()
+                        # 1. Obtenemos primero los datos de los perfiles antes de tocar la BD
+                        datos_perfiles = []
+                        for item in st.session_state.perfiles_seleccionados:
+                            cod_p = item['perfil'][0]
+                            p_particular = 1 if item['es_particular'] else 0
+                            sub_items = obtener_sub_items_de_practica(cod_p) # Esta función suele cerrar conn
+                            datos_perfiles.append((cod_p, p_particular, sub_items))
+
+                        # 2. Abrimos UNA SOLA CONEXIÓN LIMPIA para todas las actualizaciones y lecturas
+                        conn = conectar_db()
+                        c = conn.cursor()
+                        
+                        try:
+                            c.execute("ALTER TABLE resultados_items ADD COLUMN es_particular INTEGER DEFAULT 0")
+                        except Exception:
+                            pass 
+                        
                         orden_del_perfil = 1
                         
-                        for cod_p in lista_ids_ordenados:
-                            sub_items = obtener_sub_items_de_practica(cod_p)
-                            for _, c_item, _, _, _, _, _, _, s_ord, _, _ in sub_items:
+                        # 3. Actualizamos orden_visual y es_particular
+                        for cod_p, p_particular, sub_items in datos_perfiles:
+                            for sub in sub_items:
+                                c_item = sub[1]
+                                s_ord = sub[8] if len(sub) > 8 else 0
+                                
                                 try:
                                     num_orden_interno = int(s_ord) if s_ord is not None and str(s_ord).strip() != "" else 0
-                                except:
+                                except Exception:
                                     num_orden_interno = 0
                                 
                                 orden_visual_calculado = (orden_del_perfil * 100) + num_orden_interno
                                 
                                 c.execute("""
                                     UPDATE resultados_items 
-                                    SET orden_visual = ? 
+                                    SET orden_visual = ?, es_particular = ? 
                                     WHERE orden_id = ? AND codigo_perfil = ? AND codigo_item = ?
-                                """, (orden_visual_calculado, orden_id, cod_p, c_item))
+                                """, (orden_visual_calculado, p_particular, orden_id, cod_p, c_item))
                                 
                             orden_del_perfil += 1
                         
-                        conn.commit(); conn.close()
+                        # 4. Guardamos los cambios
+                        conn.commit()
+
+                        # 5. Consultamos el número real de protocolo antes de cerrar la BD
+                        num_protocolo_real = orden_id
+                        try:
+                            c.execute("SELECT nro_protocolo FROM ordenes WHERE id = ?", (orden_id,))
+                            fila_proto = c.fetchone()
+                            if fila_proto and fila_proto[0]:
+                                num_protocolo_real = fila_proto[0]
+                        except Exception as e:
+                            print(f"Nota consulta protocolo: {e}")
+                            num_protocolo_real = orden_id
+
+                        # 1. Primero leemos la fila mientras la conexión y el cursor siguen abiertos
+                        fila_proto = c.fetchone()
+                        num_protocolo_real = fila_proto[0] if fila_proto else orden_id
+
+                        cur.execute("SELECT MAX(id) FROM ordenes")
+                        fila_proto = cur.fetchone()
+                        num_protocolo_real = fila_proto[0] if fila_proto and fila_proto[0] is not None else orden_id
+
+                        # 1. Abrimos conexión y cursor local de forma segura
+                        conn_temp = conectar_db()
+                        cur_temp = conn_temp.cursor()
                         
-                        # 🚀 LA MAGIA: 
-                        # 1. Limpiamos la lista de perfiles elegidos para que la caja quede vacía
+                        # 2. Obtenemos el ID real de la orden recién creada desde la tabla ordenes
+                        cur_temp.execute("SELECT MAX(id) FROM ordenes")
+                        fila_proto = cur_temp.fetchone()
+                        num_protocolo_real = fila_proto[0] if fila_proto and fila_proto[0] is not None else orden_id
+
+                        # 3. Cerramos la conexión temporal correctamente
+                        conn_temp.close()
+                        
+                        # 4. Limpiamos estados y mostramos el mensaje de éxito con el número exacto
                         st.session_state.perfiles_seleccionados = []
-                        
-                        # 2. Mostramos un mensaje flotante gigante de éxito que dura unos segundos
                         st.toast("🎉 ¡Protocolo creado con éxito!", icon="✅")
-                        st.success(f"💾 ¡El Protocolo se ha guardado correctamente bajo el ID interno N° {orden_id}!")
+                        st.success(f"💾 ¡El Protocolo N° **{num_protocolo_real}** se ha guardado correctamente!")
                         
-                        # 3. Frenamos un segundo para que el usuario llegue a leer el cartel verde
                         import time
                         time.sleep(1.5)
-                        
-                        # 4. Forzamos el reinicio de la app. Al hacer esto, el input de búsqueda de paciente 
-                        # y todos los campos del formulario se vacían por completo para la siguiente carga.
                         st.rerun()
                     else:
                         st.error("⚠️ Error crítico: El número de protocolo ingresado ya existe en el sistema. Verifique e intente con otro.")
-            
 
+                        
 elif menu == "✏️ Modificar Protocolos":
     st.header("✏️ Edición y Modificación de Protocolos Existentes")
     
@@ -1395,18 +1491,36 @@ elif menu == "✏️ Modificar Protocolos":
         estado_actual = str(o_estado).strip().lower()
         es_validado = "validad" in estado_actual or "firmad" in estado_actual
         
-        if es_validado:
-            st.error(f"🛑 **Protocolo Bloqueado:** Este protocolo ya se encuentra **VALIDADO**. No se permiten modificaciones en su estructura o resultados para resguardar la consistencia analítica.")
-            
-            if st.button("🔓 Desvalidar Protocolo para Modificar", type="secondary", use_container_width=True, key=f"btn_desvalidar_{orden_id_mod}"):
+        if es_validado_aa:  
+            st.error("🛑 **Resultados Bloqueados:** Este protocolo ya se encuentra **VALIDADO**.")
+            if st.button("🔓 Desvalidar Protocolo para Modificar", type="secondary", use_container_width=True, key=f"btn_desvalidar_{orden_id}"):
                 conn = conectar_db(); c = conn.cursor()
-                # Cambiamos el estado a 'Pendiente' (o el término exacto que uses para carga)
-                c.execute("UPDATE ordenes SET estado = 'Pendiente' WHERE id = ?", (orden_id_mod,))
+                c.execute("UPDATE ordenes SET estado = 'Pendiente' WHERE id = ?", (orden_id,))
                 conn.commit(); conn.close()
                 st.toast("🔓 Protocolo liberado. Ya puede modificarlo.", icon="🔓")
                 st.rerun()
         else:
             st.success("🟢 **Protocolo Abierto:** Este protocolo está en proceso de carga. Las modificaciones están permitidas.")
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        if not items: 
+            st.info("Este protocolo se creó vacío.")
+        else:
+            # 🚨 BLOQUE TEMPORAL DE DEPURACIÓN EN PANTALLA
+            st.write(f"🔍 **Debug Paciente ID:** `{pac_id_sel}` | **Orden Actual ID:** `{orden_id}`")
+
+            try:
+                conn_debug = conectar_db()
+                cur_debug = conn_debug.cursor()
+                cur_debug.execute("SELECT id, fecha, paciente_id FROM ordenes WHERE paciente_id = ?", (pac_id_sel,))
+                ordenes_paciente = cur_debug.fetchall()
+                conn_debug.close()
+                st.write(f"📋 **Órdenes encontradas para este paciente:** {ordenes_paciente}")
+            except Exception as e_dbg:
+                st.write(f"⚠️ Error al depurar: {e_dbg}")
+
+            st.markdown("---")
 
         # --- SECCIÓN 1: DATOS MAESTROS DEL PROTOCOLO ---
         st.subheader("1. Datos Generales del Protocolo")
@@ -1646,8 +1760,6 @@ elif menu == "🧪 Área Analítica (Carga)":
     st.header("🧪 Carga Técnica de Resultados Analíticos")
     todas_ordenes = buscar_ordenes_todas()
     
-    html_pantalla = ""
-    
     if not todas_ordenes:
         st.warning("No se registran protocolos en el sistema.")
     else:
@@ -1660,27 +1772,30 @@ elif menu == "🧪 Área Analítica (Carga)":
         
         nombre_paciente_sel = None
         estado_orden_sel = None 
+        pac_id_sel = None  # Variable para guardar el ID real del paciente
+
         for o in todas_ordenes:
             if o[0] == orden_id:
                 nombre_paciente_sel = o[2]
                 estado_orden_sel = o[4]
                 break
 
-        # 🚀 EXTRAEMOS EDAD Y SEXO DEL PACIENTE DESDE LA BASE DE DATOS
-        p_edad = 18  # Por defecto
+        # 🚀 EXTRAEMOS PACIENTE_ID, EDAD Y SEXO DESDE LA BASE DE DATOS
+        p_edad = 18   # Por defecto
         p_sexo = "m"  # Por defecto
         try:
             conn_pac = conectar_db(); cur_pac = conn_pac.cursor()
             cur_pac.execute("""
-                SELECT p.edad, p.sexo 
+                SELECT p.id, p.edad, p.sexo 
                 FROM pacientes p 
                 JOIN ordenes o ON o.paciente_id = p.id 
                 WHERE o.id = ?
             """, (orden_id,))
             pac_data = cur_pac.fetchone()
             if pac_data:
-                p_edad = int(pac_data[0]) if pac_data[0] is not None else 18
-                p_sexo = str(pac_data[1]).strip().lower()
+                pac_id_sel = pac_data[0]
+                p_edad = int(pac_data[1]) if pac_data[1] is not None else 18
+                p_sexo = str(pac_data[2]).strip().lower()
             conn_pac.close()
         except Exception:
             pass
@@ -1717,35 +1832,85 @@ elif menu == "🧪 Área Analítica (Carga)":
             st.info("Este protocolo se creó vacío.")
         else:
             # -----------------------------------------------------------------
-            # FASE 1: CAPTURA DE VALORES E INTERFAZ GRÁFICA DE RENDERIZADO (OPTIMIZADA)
+            # FASE 1: CAPTURA DE VALORES E INTERFAZ GRÁFICA DE RENDERIZADO
             # -----------------------------------------------------------------
             valores_temporales = {}
             mapa_codigos = {}
+            
+            # Función auxiliar interna para traer antecedentes de manera segura
+            def obtener_historial_paciente_item(paciente_id, nombre_paciente, codigo_item, orden_id_actual, limite=15):
+                if not codigo_item:
+                    return []
 
-            for r_id, perf_c, item_c, sub_item, unidad, ref, resultado, es_tit, formula, metodo, en_negrita, ub_f, _ in items:
-                
+                conn = conectar_db()
+                cur = conn.cursor()
+                historial = []
+
+                # Ampliamos la consulta para buscar tanto por el código exacto como por coincidencias de sub_item
+                query = """
+                    SELECT 
+                        o.fecha, 
+                        ri.resultado, 
+                        ri.unidad, 
+                        o.id AS nro_protocolo
+                    FROM resultados_items ri
+                    JOIN ordenes o ON ri.orden_id = o.id
+                    LEFT JOIN pacientes p ON o.paciente_id = p.id
+                    WHERE (o.paciente_id = ? OR LOWER(TRIM(p.nombre)) = LOWER(TRIM(?)))
+                      AND (
+                          TRIM(UPPER(ri.codigo_item)) = TRIM(UPPER(?)) 
+                          OR TRIM(UPPER(ri.sub_item)) = TRIM(UPPER(?))
+                      )
+                      AND o.id < ?
+                      AND ri.resultado IS NOT NULL 
+                      AND TRIM(CAST(ri.resultado AS TEXT)) != ''
+                    ORDER BY o.id DESC
+                    LIMIT ?
+                """
+
+                try:
+                    cur.execute(query, (
+                        paciente_id, 
+                        str(nombre_paciente).strip(), 
+                        str(codigo_item).strip(), 
+                        str(codigo_item).strip(), 
+                        orden_id_actual, # Usamos menor (<) que el protocolo actual para garantizar que sean estrictamente históricos hacia atrás
+                        limite
+                    ))
+                    historial = cur.fetchall()
+                except Exception as e:
+                    print(f"Error al consultar historial: {e}")
+                    historial = []
+                finally:
+                    conn.close()
+
+                return historial
+
+            # Bucle principal que dibuja cada ítem en pantalla de forma ordenada
+            for r_id, perf_c, item_c, sub_item, unidad, ref, resultado, es_tit, formula, metodo, en_negrita, ub_f, orden_v, es_part in items:
+
                 if es_tit == 'Si' or str(item_c).strip().upper() == 'T_FORM': 
                     st.markdown(f"### 📊 {sub_item.upper()}")
                     st.markdown("---")
                     continue
                 
-                historial = obtener_historial_paciente_item(nombre_paciente_sel, item_c, orden_id)
+                # BÚSQUEDA DE ANTECEDENTES HISTÓRICOS
+                historial = obtener_historial_paciente_item(pac_id_sel, nombre_paciente_sel, item_c, orden_id, 10)
                 
+
                 # Proporciones equilibradas para mantener todo perfectamente horizontal
                 col_n, col_v, col_u, col_h = st.columns([3, 5, 2, 2])
-                
+
                 with col_n:
                     st.markdown(f"**{sub_item}**" if en_negrita == 'Si' else f"{sub_item}")
                     if metodo: 
                         st.caption(f"🧪 {metodo}")
-                        
+
                 with col_v:
-                    # Dos sub-columnas internas idénticas en ancho para alinear controles
                     col_sub_manual, col_sub_combo = st.columns([1, 1])
                     
                     opciones_combo = ["-- Manual --"] + resp_list
                     
-                    # Pre-seleccionar la frase si ya coincide con lo guardado en la base de datos
                     index_def = 0
                     if str(resultado).strip() in resp_list:
                         index_def = resp_list.index(str(resultado).strip()) + 1
@@ -1774,32 +1939,76 @@ elif menu == "🧪 Área Analítica (Carga)":
                         else:
                             st.text_input("Resultado", value=seleccion_resp, key=f"raw_dis_{r_id}", disabled=True, label_visibility="collapsed")
                             valores_temporales[r_id] = seleccion_resp
-                        
-                with col_u: 
-                    st.markdown(f"**{unidad}**" if unidad else "")
-                    st.caption(f"Ref: {ref}" if ref else "")
-                    
+
+                with col_u:
+                    if unidad:
+                        st.write(unidad)
+
                 with col_h:
                     if historial:
-                        html_historial = "<div style='border: 1px solid #ccc; padding: 2px 4px; background-color: #fdfdfd; border-radius: 4px; font-family: monospace; font-size: 11px; color: #333; line-height: 1.1;'>"
-                        for idx, (f_hist, r_hist, u_hist) in enumerate(historial[:2]): 
-                            bg_color = "#f1f3f5" if idx % 2 == 0 else "#ffffff"
+                        html_historial = ""
+
+                        for idx, item_h in enumerate(historial):
+                            f_hist = item_h[0] if len(item_h) > 0 else ""
+                            r_hist = item_h[1] if len(item_h) > 1 else ""
+                            u_hist = item_h[2] if len(item_h) > 2 else ""
+                            prot_h = item_h[3] if len(item_h) > 3 else ""
+
+                            fondo = "#eff6ff" if idx == 0 else ("#ffffff" if idx % 2 == 0 else "#f8fafc")
+                            borde = "#60a5fa" if idx == 0 else "#e2e8f0"
+
                             html_historial += f"""
-                            <div style='background-color: {bg_color}; display: flex; justify-content: space-between; padding: 1px 2px;'>
-                                <span style='color: #666;'>{f_hist}</span>
-                                <span style='font-weight: bold;'>{r_hist}</span>
+                            <div style="
+                                background-color: {fondo};
+                                border: 1px solid {borde};
+                                border-radius: 6px;
+                                padding: 4px 6px;
+                                margin-bottom: 4px;
+                                line-height: 1.1;
+                                font-size: 10px;
+                                color: #0f172a;
+                                white-space: nowrap;
+                                overflow: hidden;
+                                text-overflow: ellipsis;
+                            ">
+                                <span style="font-size: 8.5px; color: #64748b;">{f_hist} · #{prot_h}</span>
+                                <span style="font-weight: 700; color: #16a34a;"> — {r_hist}</span>
+                                <span style="font-size: 8.5px; color: #475569;"> {u_hist}</span>
                             </div>
                             """
-                        html_historial += "</div>"
-                        st.markdown(html_historial, unsafe_allow_html=True)
-                    else:
-                        st.caption("✨ *Sin antecedentes*")
 
-                # Alimentamos el mapa de códigos en tiempo real con lo que hay en pantalla
+                        st.markdown(
+                            f"""
+                            <div style="
+                                border: 1px solid #cbd5e1;
+                                background-color: #f8fafc;
+                                border-radius: 10px;
+                                padding: 5px;
+                                height: 180px;
+                                overflow-y: auto;
+                                box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+                            ">
+                                {html_historial}
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                    else:
+                        st.caption("Sin historial")
+
+
+
+
+
+
+
+
+
+                # Alimentamos el mapa de códigos en tiempo real para cada ítem procesado
                 codigo_str = str(item_c).strip().upper()
                 mapa_codigos[codigo_str] = {
                     'r_id': r_id,
-                    'valor': str(valores_temporales[r_id]).strip()
+                    'valor': str(valores_temporales.get(r_id, "")).strip()
                 }
             
             st.markdown("<br>", unsafe_allow_html=True)
@@ -1898,7 +2107,7 @@ elif menu == "🧪 Área Analítica (Carga)":
                 if "FGE" in mapa_codigos: valores_temporales[mapa_codigos["FGE"]['r_id']] = fge_val
 
             # Fórmulas Dinámicas Personalizadas
-            for r_id_f, _, item_c_f, _, _, _, _, _, formula_f, _, _, _, _ in items:
+            for r_id_f, _, item_c_f, _, _, _, _, _, formula_f, _, _, _, _, _ in items:
                 if formula_f and str(formula_f).strip():
                     expr_evaluable = str(formula_f).strip().upper()
                     codigos_db = sorted(mapa_codigos.keys(), key=len, reverse=True)
@@ -1971,11 +2180,9 @@ elif menu == "🧪 Área Analítica (Carga)":
             if st.button("💾 Guardar Resultados", type="primary", disabled=es_validado_aa):
                 conn = conectar_db(); cur = conn.cursor()
                 
-                # Guardamos los resultados numéricos y calculados de la Fase 2
                 for r_id, val in valores_temporales.items():
                     cur.execute("UPDATE resultados_items SET resultado = ? WHERE id = ?", (str(val), r_id))
                 
-                # Guardamos la imagen (BLOB)
                 if tiene_pxe and r_id_pxe:
                     if archivo_grafico is not None:
                         bytes_imagen = archivo_grafico.getvalue()
@@ -1990,10 +2197,6 @@ elif menu == "🧪 Área Analítica (Carga)":
                     st.rerun()
                 else:
                     st.warning("Se guardaron los demás resultados, pero el LDL no pudo procesarse. Revisa el error rojo de arriba.")
-            
-# ==========================================
-        
-
 elif menu == "🖨️ Validación e Informes":
     st.header("🖨️ Impresión y Validación de Informes Bioquímicos")
     ordenes = buscar_ordenes_todas()
@@ -2073,7 +2276,7 @@ elif menu == "🖨️ Validación e Informes":
         # 🖥️ CONSTRUCCIÓN DEL CUERPO DE RESULTADOS
         # ==========================================
         html_filas_resultados = ""
-        for _, perf_c, item_c, sub_item, unidad, ref, resultado, es_tit, _, metodo, en_negrita, _, _ in items_proto:
+        for _, perf_c, item_c, sub_item, unidad, ref, resultado, es_tit, _, metodo, en_negrita, *resto in items_proto:
             resultado_limpio = str(resultado).strip() if resultado is not None else ""
             if es_tit != 'Si' and str(item_c).strip().upper() != 'T_FORM' and (resultado_limpio == "" or resultado_limpio.lower() == "none"):
                 continue
@@ -2118,10 +2321,68 @@ elif menu == "🖨️ Validación e Informes":
                     <td><b>{res_display}</b></td>
                     <td style="font-size: 12px; white-space: pre-line; padding-top: 4px; padding-bottom: 4px;">{ref}</td>
                 </tr>"""
-
         # ==========================================
         # 📑 HTML COMPLETO DE TABLA ORIGINAL
         # ==========================================
+        cfg = obtener_configuracion_general()
+        leyenda_colegio = cfg[8] if len(cfg) > 8 else ""
+
+        html_cuerpo_resultados = f"<tbody><tr><td colspan='3'><style>table tr td:nth-child(1), table tr th:nth-child(1) {{ width: 40% !important; text-align: left !important; }} table tr td:nth-child(2), table tr th:nth-child(2) {{ width: 30% !important; text-align: center !important; }} table tr td:nth-child(3), table tr th:nth-child(3) {{ width: 30% !important; text-align: left !important; }}</style><table style='width: 100%; border-collapse: collapse; color: black;'>{html_filas_resultados}</table>{html_grafico_pantalla}</td></tr></tbody>"
+        
+        html_encabezado = f"""
+        <thead>
+        <tr>
+          <td colspan="3" style="padding-bottom: 10px;">
+            <table style="width: 100%; border-collapse: collapse;">
+              <tr>
+                <td style="width: 25%; vertical-align: middle;">{html_logo}</td>
+                <td style="width: 45%; text-align: center; vertical-align: middle; padding: 10px 0;">
+                  <span style="font-size: 22px; font-weight: bold; color: black; text-transform: uppercase;">
+                    LABORATORIO DE ANÁLISIS CLÍNICOS
+                  </span>
+                </td>
+                <td style="width: 30%; text-align: center; vertical-align: middle; font-size: 12px; line-height: 1.3;">
+                  <b>Bioq.: Fernández María de los Ángeles</b><br>M.P.: 3774<br><br>
+                  <b>Bioq.: Farfán Luis A.</b><br>M.P.: 5092
+                </td>
+              </tr>
+            </table>
+            <hr style="border-top: 2px solid black; margin: 8px 0 10px 0;">
+            <table style="width: 100%; font-size: 13px; color: black; line-height: 1.4;">
+              <tr>
+                <td style="width: 60%;"><b>Paciente:</b> {o_paciente}</td>
+                <td style="width: 40%;"><b>Fecha:</b> {fecha_informe_final}</td>
+              </tr>
+              <tr>
+                <td><b>D.N.I.:</b> {o_dni} &nbsp;&nbsp;&nbsp;&nbsp; <b>Sexo:</b> {p_sexo} &nbsp;&nbsp;&nbsp;&nbsp; <b>Edad:</b> {p_edad} años</td>
+                <td><b>N&deg; Protocolo:</b> {o_proto}</td>
+              </tr>
+              <tr>
+                <td><b>Obra Social:</b> {o_obra} &nbsp;&nbsp;&nbsp;&nbsp; <b>N&deg; Afiliado:</b> {p_afiliado}</td>
+                <td><b>Dr./a:</b> {o_medico}</td>
+              </tr>
+            </table>
+            <table style="width: 100%; border-collapse: collapse; margin-top: 10px; border-bottom: 2px solid black;">
+              <tr>
+                <th style="text-align: center; font-size: 13px; padding: 4px; width: 40%;">DETERMINACIÓN</th>
+                <th style="text-align: center; font-size: 13px; padding: 4px; width: 30%;">RESULTADO</th>
+                <th style="text-align: center; font-size: 13px; padding: 4px; width: 30%;">VALORES DE REFERENCIA</th>
+              </tr>
+            </table>
+          </td>
+        </tr>
+        </thead>
+        """
+
+        # Construcción del cuerpo de resultados
+        html_cuerpo_resultados = f"""
+        <tbody>
+          {html_filas_resultados}
+          <tr><td colspan="3">{html_grafico_pantalla}</td></tr>
+        </tbody>
+        """
+
+        # Construcción del informe completo
         html_informe_estructurado = f"""
         <!DOCTYPE html>
         <html>
@@ -2142,11 +2403,27 @@ elif menu == "🖨️ Validación e Informes":
                 thead {{
                     display: table-header-group;
                 }}
+                tbody {{
+                    display: table-row-group;
+                }}
                 tfoot {{
                     display: table-footer-group;
                 }}
                 tr {{
                     page-break-inside: avoid;
+                }}
+                /* Estilos para centrar columnas de resultados */
+                table tr td:nth-child(1), table tr th:nth-child(1) {{
+                    width: 40% !important;
+                    text-align: center !important;
+                }}
+                table tr td:nth-child(2), table tr th:nth-child(2) {{
+                    width: 30% !important;
+                    text-align: center !important;
+                }}
+                table tr td:nth-child(3), table tr th:nth-child(3) {{
+                    width: 30% !important;
+                    text-align: center !important;
                 }}
                 @media print {{
                     @page {{
@@ -2159,82 +2436,37 @@ elif menu == "🖨️ Validación e Informes":
         <body>
             <div style="padding: 10px; border: 1px solid #111;">
                 <table class="tabla-global">
-                    
-                    <!-- ENCABEZADO -->
-                    <thead>
-                        <tr>
-                            <td colspan="3" style="padding-bottom: 10px;">
-                                <table style="width: 100%; border-collapse: collapse;">
-                                    <tr>
-                                        <td style="width: 25%; vertical-align: middle;">{html_logo}</td>
-                                        <td style="width: 45%; text-align: center; vertical-align: middle;">
-                                            <span style="font-size: 20px; font-weight: bold; color: black; text-transform: uppercase;">
-                                                LABORATORIO DE ANÁLISIS CLÍNICOS
-                                            </span>
-                                        </td>
-                                        <td style="width: 30%; text-align: right; vertical-align: middle; font-size: 12px; line-height: 1.3;">
-                                            <b>Bioq.: Fernández María de los Ángeles</b><br>M.P.: 3774<br>
-                                            <b>Bioq.: Farfán Luis A.</b><br>M.P.: 5092
-                                        </td>
-                                    </tr>
-                                </table>
-                                <hr style="border-top: 2px solid black; margin: 8px 0 10px 0;">
-                                <table style="width: 100%; font-size: 13px; color: black; line-height: 1.4;">
-                                    <tr><td style="width: 60%;"><b>Paciente:</b> {o_paciente}</td><td style="width: 40%;"><b>Fecha:</b> {fecha_informe_final}</td></tr>
-                                    <tr><td><b>D.N.I.:</b> {o_dni} &nbsp;&nbsp;&nbsp;&nbsp; <b>Sexo:</b> {p_sexo} &nbsp;&nbsp;&nbsp;&nbsp; <b>Edad:</b> {p_edad} años</td><td><b>N° Protocolo:</b> {o_proto}</td></tr>
-                                    <tr><td><b>Obra Social:</b> {o_obra} &nbsp;&nbsp;&nbsp;&nbsp; <b>N° Afiliado:</b> {p_afiliado}</td><td><b>Dr./a:</b> {o_medico}</td></tr>
-                                </table>
-                                
-                                <table style="width: 100%; border-collapse: collapse; margin-top: 10px; border-bottom: 2px solid black;">
-                                    <tr>
-                                        <th style="text-align: left; font-size: 13px; padding: 4px; width: 40%;">DETERMINACIÓN</th>
-                                        <th style="text-align: left; font-size: 13px; padding: 4px; width: 25%;">RESULTADO</th>
-                                        <th style="text-align: left; font-size: 13px; padding: 4px; width: 35%;">VALORES DE REFERENCIA</th>
-                                    </tr>
-                                </table>
-                            </td>
-                        </tr>
-                    </thead>
-
-                    <!-- PIE CON FIRMAS -->
+                    {html_encabezado}
+                    {html_cuerpo_resultados}
                     <tfoot>
                         <tr>
                             <td colspan="3" style="padding-top: 20px;">
                                 <table style="width: 100%; font-size: 12px; text-align: center;">
                                     <tr>
-                                        <td style="width: 50%; vertical-align: bottom;">
-                                            <span>{html_f1}</span>
-                                            <div style="border-top: 1px dotted black; width: 180px; margin: 0 auto;"></div>
+                                        <td style="width: 50%; vertical-align: bottom; text-align: center;">
+                                            {html_f1}
+                                            <div style="border-top: 1px dotted black; width: 180px; margin: 5px auto 0 auto;"></div>
                                             <b>Bioq. Fernández María de los Ángeles</b><br>Bioquímica - M.P. 3774
                                         </td>
-                                        <td style="width: 50%; vertical-align: bottom;">
-                                            <span>{html_f2}</span>
-                                            <div style="border-top: 1px dotted black; width: 180px; margin: 0 auto;"></div>
+                                        <td style="width: 50%; vertical-align: bottom; text-align: center;">
+                                            {html_f2}
+                                            <div style="border-top: 1px dotted black; width: 180px; margin: 5px auto 0 auto;"></div>
                                             <b>Bioq. Farfán Luis A.</b><br>Bioquímico - M.P. 5092
                                         </td>
                                     </tr>
                                 </table>
+                                <div style="margin-top: 8px; text-align: center; font-size: 10px; color: #444; line-height: 1.2;">
+                                    {leyenda_colegio}
+                                </div>
                             </td>
                         </tr>
                     </tfoot>
-
-                    <!-- CUERPO DE RESULTADOS -->
-                    <tbody>
-                        <tr>
-                            <td colspan="3">
-                                <table style="width: 100%; border-collapse: collapse; color: black;">
-                                    {html_filas_resultados}
-                                </table>
-                                {html_grafico_pantalla}
-                            </td>
-                        </tr>
-                    </tbody>
-
                 </table>
             </div>
         </body>
         </html>
         """
+
         
         # 💡 CAMBIO CLAVE: Conversión de HTML a Data URL limpia
         import urllib.parse
@@ -2252,15 +2484,41 @@ elif menu == "🖨️ Validación e Informes":
 
         with col_btn1:
             if st.button("🖨️ Imprimir Informe", key="btn_lis_imprimir", type="primary", use_container_width=True):
+                cfg = obtener_configuracion_general()
+                leyenda_colegio = cfg[8] if len(cfg) > 8 else ""
+
                 html_impresion_crudo = f"""
                 <!DOCTYPE html>
                 <html>
                 <head>
                     <meta charset="utf-8">
                     <title>Informe Bioquímico - Protocolo {o_proto}</title>
+                    <style>
+                        @page {{
+                            size: A4;
+                            margin: 15mm;
+                        }}
+                        body {{
+                            font-family: Arial, sans-serif;
+                            position: relative;
+                            min-height: 100vh;
+                        }}
+                        .footer {{
+                            position: fixed;
+                            bottom: 8mm;
+                            left: 0;
+                            right: 0;
+                            text-align: center;
+                            font-size: 10px;
+                            color: #444;
+                        }}
+                    </style>
                 </head>
                 <body>
                     {html_informe_estructurado}
+
+                    
+
                     <script>
                         window.onload = function() {{ window.print(); }};
                     </script>
@@ -2269,8 +2527,6 @@ elif menu == "🖨️ Validación e Informes":
                 """
                 encoded_print = urllib.parse.quote(html_impresion_crudo)
                 src_print = f"data:text/html;charset=utf-8,{encoded_print}"
-                
-                # 🚀 SOLUCIÓN: Cambiado height=0 a height=1 para pasar la validación
                 st.iframe(src=src_print, height=1)
 
         with col_btn2:
@@ -2292,6 +2548,10 @@ elif menu == "🖨️ Validación e Informes":
     else:
         st.info("No hay órdenes registradas para validar o imprimir.")
   
+  
+# -----------------------------------------------------------------------------
+# 💵 MÓDULO 1: FACTURACIÓN OBRAS SOCIALES (RESTAURADO CON SUS 2 VISTAS)
+# -----------------------------------------------------------------------------
 elif menu == "💵 Facturación Obras Sociales":
     st.header("💵 Liquidación y Facturación de Obras Sociales")
     lista_os_f = listar_obras_sociales()
@@ -2305,11 +2565,11 @@ elif menu == "💵 Facturación Obras Sociales":
     with col1:
         os_f_sel = st.selectbox("Seleccione Obra Social:", options=dict_os_f.keys(), format_func=lambda x: dict_os_f[x], key="sb_os_f")
     with col2:
-        f_desde = st.date_input("Fecha Desde:", value=date(date.today().year, date.today().month, 1))
+        f_desde = st.date_input("Fecha Desde:", value=date(date.today().year, date.today().month, 1), key="fact_fecha_desde")
     with col3:
-        f_hasta = st.date_input("Fecha Hasta:", value=date.today())
+        f_hasta = st.date_input("Fecha Hasta:", value=date.today(), key="fact_fecha_hasta")
     with col4:
-        ambito_f = st.selectbox("Ámbito:", options=["Ambos", "Externo", "Internado"])
+        ambito_f = st.selectbox("Ámbito:", options=["Ambos", "Externo", "Internado"], key="fact_ambito")
     
     valor_ub_os_actual = 0.0
     incluye_acto = 0
@@ -2338,6 +2598,10 @@ elif menu == "💵 Facturación Obras Sociales":
         fecha_orden_str = str(o[1]).strip() if o[1] is not None else ""
         ambito_o = str(o[14]).strip().lower() if o[14] is not None else ""
         
+        # EXCLUSIÓN 1: Si la orden entera fue pasada a PARTICULAR, saltar
+        if os_en_bd == "particular":
+            continue
+
         if estado_o in ['validada', 'cerrada'] and os_en_bd == nombre_os_buscada:
             fecha_objeto = None
             for formato in ('%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y'):
@@ -2356,223 +2620,343 @@ elif menu == "💵 Facturación Obras Sociales":
         st.info("No se encontraron órdenes validadas o cerradas para los filtros seleccionados.")
     else:
         st.success(f"📋 Se encontraron **{len(ordenes_filtradas)}** órdenes listas para liquidar en el período seleccionado.")
-        t_vista = st.radio("Tipo de Reporte / Vista:", options=["1. Detalle por Pacientes", "2. Resumen Consolidado (Agrupado por Código)"], horizontal=True)
+        t_vista = st.radio("Tipo de Reporte / Vista:", options=["1. Detalle por Pacientes", "2. Resumen Consolidado (Agrupado por Código)"], horizontal=True, key="fact_tipo_vista")
         st.markdown("---")
         
         codigos_hemograma = ['GR_01', 'HB_02', 'HT_03', 'VCM_04', 'HCM_05', 'CHCM_06', 'GB_07', 'NEU_08', 'EOS_09', 'BAS_10', 'LIN_11', 'MON_12', 'PLAQ_13']
-        # Mantenemos las exclusiones lógicas estrictas de cálculos internos
-        codigos_no_facturables = ['C/H', 'CnoH', 'IA', 'FGE']
+        codigos_no_facturables = ['C/H', 'CNOH', 'IA', 'FGE']
 
-        # -----------------------------------------------------------------
-        # OPCIÓN 1: VISTA DETALLADA POR PACIENTES
-        # -----------------------------------------------------------------
-        if t_vista == "1. Detalle por Pacientes":
-            filas_vouchers = []
-            gran_total = 0.0
-            for o in ordenes_filtradas:
-                items_o = obtener_items_para_cargar(o[0])
-                hemograma_procesado_en_orden = False
-                tiene_analisis_facturables = False
-                
-                for _, perf_c, cod_i, sub_i, _, _, _, es_t, _, _, _, ub_f, _ in items_o:
-                    codigo_limpio = str(cod_i).strip().upper()
-
-                    if codigo_limpio in codigos_no_facturables: 
-                        continue
+        clave_contenedor = f"cont_fact_{os_f_sel}_{f_desde}_{f_hasta}_{ambito_f}_{t_vista.replace(' ', '_')}"
+        
+        with st.container(key=clave_contenedor):
+            # -----------------------------------------------------------------
+            # OPCIÓN 1: VISTA DETALLADA POR PACIENTES
+            # -----------------------------------------------------------------
+            if t_vista == "1. Detalle por Pacientes":
+                filas_vouchers = []
+                gran_total = 0.0
+                for o in ordenes_filtradas:
+                    items_o = obtener_items_para_cargar(o[0])
+                    hemograma_procesado_en_orden = False
+                    tiene_analisis_facturables = False
                     
-                    # 🛡️ REGLA DE ORO UNIVERSAL: Si la UB está vacía, es None o es 0 -> NO SE FACTURA.
-                    # Si es mayor a 0, SE FACTURA SIEMPRE (ignora si es_t == 'Si')
-                    try:
-                        if ub_f is None or str(ub_f).strip() == "" or float(str(ub_f).replace(',', '.')) == 0:
+                    for item in items_o:
+                        perf_c = str(item[1]).strip() if item[1] is not None else ""
+                        cod_i = str(item[2]).strip() if item[2] is not None else ""
+                        sub_i = str(item[3]).strip() if item[3] is not None else ""
+                        ub_f = item[11]
+                        
+                        # EXCLUSIÓN 2: Verificar si el ítem individual está marcado como es_particular
+                        val_particular = item[-1] if len(item) > 13 else 0
+                        if val_particular in [1, '1', True, 'true', 'True']:
                             continue
-                    except ValueError:
-                        continue
-                    
-                    tiene_analisis_facturables = True
-                    
-                    if perf_c == '475' or codigo_limpio in codigos_hemograma:
-                        if not hemograma_procesado_en_orden:
-                            precio_final = 5.0 * valor_ub_os_actual
+
+                        codigo_limpio = cod_i.upper()
+
+                        if codigo_limpio in codigos_no_facturables: 
+                            continue
+                        
+                        try:
+                            if ub_f is None or str(ub_f).strip() == "" or float(str(ub_f).replace(',', '.')) == 0:
+                                continue
+                        except ValueError:
+                            continue
+                        
+                        tiene_analisis_facturables = True
+                        
+                        if perf_c == '475' or codigo_limpio in codigos_hemograma:
+                            if not hemograma_procesado_en_orden:
+                                precio_final = 5.0 * valor_ub_os_actual
+                                gran_total += precio_final
+                                filas_vouchers.append({
+                                    "Protocolo": o[10], "Paciente": o[2], "DNI": o[3],
+                                    "Código": "475", "Práctica": "HEMOGRAMA COMPLETO",
+                                    "U.B.": 5.0, "Precio ($)": f"$ {precio_final:,.2f}"
+                                })
+                                hemograma_procesado_en_orden = True
+                        else:
+                            ub_numerica = float(str(ub_f).replace(',', '.'))
+                            precio_final = ub_numerica * valor_ub_os_actual
                             gran_total += precio_final
                             filas_vouchers.append({
                                 "Protocolo": o[10], "Paciente": o[2], "DNI": o[3],
-                                "Código": "475", "Práctica": "HEMOGRAMA COMPLETO",
-                                "U.B.": 5.0, "Precio ($)": f"$ {precio_final:,.2f}"
+                                "Código": cod_i, "Práctica": sub_i.upper(),
+                                "U.B.": ub_numerica, "Precio ($)": f"$ {precio_final:,.2f}"
                             })
-                            hemograma_procesado_en_orden = True
-                    else:
-                        ub_numerica = float(str(ub_f).replace(',', '.'))
-                        precio_final = ub_numerica * valor_ub_os_actual
-                        gran_total += precio_final
-                        filas_vouchers.append({
-                            "Protocolo": o[10], "Paciente": o[2], "DNI": o[3],
-                            "Código": cod_i, "Práctica": sub_i.upper(),
-                            "U.B.": ub_numerica, "Precio ($)": f"$ {precio_final:,.2f}"
-                        })
-                
-                if tiene_analisis_facturables:
-                    if incluye_acto == 1:
-                        gran_total += valor_acto
-                        filas_vouchers.append({
-                            "Protocolo": o[10], "Paciente": o[2], "DNI": o[3],
-                            "Código": "1", "Práctica": "ACTO BIOQUIMICO",
-                            "U.B.": 6.0, "Precio ($)": f"$ {valor_acto:,.2f}"
-                        })
-                    if incluye_gbi == 1:
-                        gran_total += valor_gbi
-                        filas_vouchers.append({
-                            "Protocolo": o[10], "Paciente": o[2], "DNI": o[3],
-                            "Código": "1002", "Práctica": "GBI - GESTION BIOQUIMICA INTEGRAL",
-                            "U.B.": 0.0, "Precio ($)": f"$ {valor_gbi:,.2f}"
-                        })
-            
-            df_detalle = pd.DataFrame(filas_vouchers) if filas_vouchers else pd.DataFrame(columns=["Protocolo", "Paciente", "DNI", "Código", "Práctica", "U.B.", "Precio ($)"])
-            html_tabla_detalle = df_detalle.to_html(index=False, classes='tabla-facturacion', border=1)
-
-            st.html(f"""
-            <div id="print-area">
-                <style>
-                    .tabla-facturacion {{ width: 100%; border-collapse: collapse; font-family: Arial, sans-serif; margin-top: 15px; margin-bottom: 15px; }}
-                    .tabla-facturacion th, .tabla-facturacion td {{ padding: 8px; text-align: left; border: 1px solid #ddd; color: black !important; }}
-                    .tabla-facturacion th {{ background-color: #f2f2f2; font-weight: bold; }}
-                </style>
-                <h3 style='text-align: center; color: black; margin-bottom:0;'>LIQUIDACIÓN DE OBRA SOCIAL: {dict_os_f[os_f_sel]}</h3>
-                <p style='text-align: center; color: #333; margin-top:5px; margin-bottom:20px;'>Período: {f_desde.strftime('%d/%m/%Y')} al {f_hasta.strftime('%d/%m/%Y')} | Ámbito: {ambito_f}</p>
-                {html_tabla_detalle}
-                <h3 style='color: black; margin-top: 20px;'>TOTAL COMPROBANTES: $ {gran_total:,.2f}</h3>
-            </div>
-            """)
-            
-            # 🖨️ BOTÓN DE IMPRESIÓN PARA DETALLE
-            st.button("🖨️ Imprimir Detalle por Pacientes", key="btn_print_detalle", use_container_width=True)
-            st.components.v1.html("""
-                <script>
-                    const buttons = window.parent.document.querySelectorAll('button');
-                    const printButton = Array.from(buttons).find(el => el.innerText.includes('Imprimir Detalle por Pacientes'));
-                    if (printButton) {
-                        printButton.onclick = function() {
-                            const printContents = window.parent.document.getElementById('print-area').innerHTML;
-                            const originalContents = window.parent.document.body.innerHTML;
-                            window.parent.print();
-                        };
-                    }
-                </script>
-            """, height=0)
-
-        # -----------------------------------------------------------------
-        # OPCIÓN 2: RESUMEN CONSOLIDADO (AGRUPADO POR CÓDIGO)
-        # -----------------------------------------------------------------
-        elif t_vista == "2. Resumen Consolidado (Agrupado por Código)":
-            mapa_consolidado = {}
-            gran_total_consolidado = 0.0
-            cant_actos = 0
-            cant_gbis = 0
-
-            for o in ordenes_filtradas:
-                items_o = obtener_items_para_cargar(o[0])
-                hemograma_procesado_en_orden = False
-                tiene_analisis_facturables = False
-                
-                for _, perf_c, cod_i, sub_i, _, _, _, es_t, _, _, _, ub_f, _ in items_o:
-                    codigo_limpio = str(cod_i).strip().upper()
-
-                    if codigo_limpio in codigos_no_facturables: 
-                        continue
                     
-                    # 🛡️ REGLA DE ORO UNIVERSAL en Consolidado
-                    try:
-                        if ub_f is None or str(ub_f).strip() == "" or float(str(ub_f).replace(',', '.')) == 0:
-                            continue
-                    except ValueError:
-                        continue
+                    if tiene_analisis_facturables:
+                        if incluye_acto == 1:
+                            gran_total += valor_acto
+                            filas_vouchers.append({
+                                "Protocolo": o[10], "Paciente": o[2], "DNI": o[3],
+                                "Código": "1", "Práctica": "ACTO BIOQUIMICO",
+                                "U.B.": 6.0, "Precio ($)": f"$ {valor_acto:,.2f}"
+                            })
+                        if incluye_gbi == 1:
+                            gran_total += valor_gbi
+                            filas_vouchers.append({
+                                "Protocolo": o[10], "Paciente": o[2], "DNI": o[3],
+                                "Código": "1002", "Práctica": "GBI - GESTION BIOQUIMICA INTEGRAL",
+                                "U.B.": 0.0, "Precio ($)": f"$ {valor_gbi:,.2f}"
+                            })
+                
+                df_detalle = pd.DataFrame(filas_vouchers) if filas_vouchers else pd.DataFrame(columns=["Protocolo", "Paciente", "DNI", "Código", "Práctica", "U.B.", "Precio ($)"])
+                html_tabla_detalle = df_detalle.to_html(index=False, classes='tabla-facturacion', border=1)
+
+                st.html(f"""
+                <div id="print-area">
+                    <style>
+                        .tabla-facturacion {{ width: 100%; border-collapse: collapse; font-family: Arial, sans-serif; margin-top: 15px; margin-bottom: 15px; }}
+                        .tabla-facturacion th, .tabla-facturacion td {{ padding: 8px; text-align: left; border: 1px solid #ddd; color: black !important; }}
+                        .tabla-facturacion th {{ background-color: #f2f2f2; font-weight: bold; }}
+                        .btn-imprimir-html {{
+                            background-color: #0066cc; color: white; border: none; padding: 10px 20px;
+                            font-size: 16px; border-radius: 5px; cursor: pointer; width: 100%; margin-top: 10px;
+                        }}
+                        @media print {{
+                            .btn-imprimir-html {{ display: none; }}
+                        }}
+                    </style>
+                    <h3 style='text-align: center; color: black; margin-bottom:0;'>LIQUIDACIÓN DE OBRA SOCIAL: {dict_os_f[os_f_sel]}</h3>
+                    <p style='text-align: center; color: #333; margin-top:5px; margin-bottom:20px;'>Período: {f_desde.strftime('%d/%m/%Y')} al {f_hasta.strftime('%d/%m/%Y')} | Ámbito: {ambito_f}</p>
+                    {html_tabla_detalle}
+                    <h3 style='color: black; margin-top: 20px;'>TOTAL COMPROBANTES: $ {gran_total:,.2f}</h3>
+                    <button class="btn-imprimir-html" onclick="window.print()">🖨️ Imprimir Detalle por Pacientes</button>
+                </div>
+                """)
+
+            # -----------------------------------------------------------------
+            # OPCIÓN 2: RESUMEN CONSOLIDADO (AGRUPADO POR CÓDIGO)
+            # -----------------------------------------------------------------
+            elif t_vista == "2. Resumen Consolidado (Agrupado por Código)":
+                mapa_consolidado = {}
+                gran_total_consolidado = 0.0
+                cant_actos = 0
+                cant_gbis = 0
+
+                for o in ordenes_filtradas:
+                    items_o = obtener_items_para_cargar(o[0])
+                    hemograma_procesado_en_orden = False
+                    tiene_analisis_facturables = False
+                    
+                    for item in items_o:
+                        perf_c = str(item[1]).strip() if item[1] is not None else ""
+                        cod_i = str(item[2]).strip() if item[2] is not None else ""
+                        sub_i = str(item[3]).strip() if item[3] is not None else ""
+                        ub_f = item[11]
                         
-                    tiene_analisis_facturables = True
-
-                    if perf_c == '475' or codigo_limpio in codigos_hemograma:
-                        if not hemograma_procesado_en_orden:
-                            cod_resumen = "475"
-                            nom_resumen = "HEMOGRAMA COMPLETO"
-                            ub_resumen = 5.0
-                            hemograma_procesado_en_orden = True
-                        else:
+                        val_particular = item[-1] if len(item) > 13 else 0
+                        if val_particular in [1, '1', True, 'true', 'True']:
                             continue
+
+                        codigo_limpio = cod_i.upper()
+
+                        if codigo_limpio in codigos_no_facturables: 
+                            continue
+                        
+                        try:
+                            if ub_f is None or str(ub_f).strip() == "" or float(str(ub_f).replace(',', '.')) == 0:
+                                continue
+                        except ValueError:
+                            continue
+                            
+                        tiene_analisis_facturables = True
+
+                        if perf_c == '475' or codigo_limpio in codigos_hemograma:
+                            if not hemograma_procesado_en_orden:
+                                cod_resumen = "475"
+                                nom_resumen = "HEMOGRAMA COMPLETO"
+                                ub_resumen = 5.0
+                                hemograma_procesado_en_orden = True
+                            else:
+                                continue
+                        else:
+                            cod_resumen = cod_i
+                            nom_resumen = sub_i.upper()
+                            ub_resumen = float(str(ub_f).replace(',', '.'))
+
+                        if cod_resumen not in mapa_consolidado:
+                            mapa_consolidado[cod_resumen] = {
+                                "Código": cod_resumen, "Práctica": nom_resumen,
+                                "U.B. Unit": ub_resumen, "Cantidad": 0, "Total U.B.": 0.0
+                            }
+                        
+                        mapa_consolidado[cod_resumen]["Cantidad"] += 1
+                        mapa_consolidado[cod_resumen]["Total U.B."] += ub_resumen
+
+                    if tiene_analisis_facturables:
+                        if incluye_acto == 1: cant_actos += 1
+                        if incluye_gbi == 1: cant_gbis += 1
+
+                filas_consolidadas = []
+                for c_key, c_val in mapa_consolidado.items():
+                    precio_acumulado = c_val["Total U.B."] * valor_ub_os_actual
+                    gran_total_consolidado += precio_acumulado
+                    filas_consolidadas.append({
+                        "Código": c_val["Código"], "Práctica": c_val["Práctica"],
+                        "U.B. Unit": c_val["U.B. Unit"], "Cantidad": c_val["Cantidad"],
+                        "Total U.B.": c_val["Total U.B."], "Subtotal ($)": f"$ {precio_acumulado:,.2f}"
+                    })
+
+                if cant_actos > 0:
+                    tot_acto_f = cant_actos * valor_acto
+                    gran_total_consolidado += tot_acto_f
+                    filas_consolidadas.append({
+                        "Código": "1", "Práctica": "ACTO BIOQUIMICO", "U.B. Unit": 6.0,
+                        "Cantidad": cant_actos, "Total U.B.": 6.0 * cant_actos, "Subtotal ($)": f"$ {tot_acto_f:,.2f}"
+                    })
+                if cant_gbis > 0:
+                    tot_gbi_f = cant_gbis * valor_gbi
+                    gran_total_consolidado += tot_gbi_f
+                    filas_consolidadas.append({
+                        "Código": "1002", "Práctica": "GBI - GESTION BIOQUIMICA INTEGRAL", "U.B. Unit": 0.0,
+                        "Cantidad": cant_gbis, "Total U.B.": 0.0, "Subtotal ($)": f"$ {tot_gbi_f:,.2f}"
+                    })
+
+                df_consolidado = pd.DataFrame(filas_consolidadas) if filas_consolidadas else pd.DataFrame(columns=["Código", "Práctica", "U.B. Unit", "Cantidad", "Total U.B.", "Subtotal ($)"])
+                html_tabla_consolidado = df_consolidado.to_html(index=False, classes='tabla-facturacion', border=1)
+
+                st.html(f"""
+                <div id="print-area">
+                    <style>
+                        .tabla-facturacion {{ width: 100%; border-collapse: collapse; font-family: Arial, sans-serif; margin-top: 15px; margin-bottom: 15px; }}
+                        .tabla-facturacion th, .tabla-facturacion td {{ padding: 8px; text-align: left; border: 1px solid #ddd; color: black !important; }}
+                        .tabla-facturacion th {{ background-color: #e6f2ff; font-weight: bold; }}
+                        .btn-imprimir-html {{
+                            background-color: #0066cc; color: white; border: none; padding: 10px 20px;
+                            font-size: 16px; border-radius: 5px; cursor: pointer; width: 100%; margin-top: 10px;
+                        }}
+                        @media print {{
+                            .btn-imprimir-html {{ display: none; }}
+                        }}
+                    </style>
+                    <h3 style='text-align: center; color: black; margin-bottom:0;'>RESUMEN CONSOLIDADO DE LIQUIDACIÓN: {dict_os_f[os_f_sel]}</h3>
+                    <p style='text-align: center; color: #333; margin-top:5px; margin-bottom:20px;'>Período: {f_desde.strftime('%d/%m/%Y')} al {f_hasta.strftime('%d/%m/%Y')} | Ámbito: {ambito_f}</p>
+                    {html_tabla_consolidado}
+                    <h3 style='color: black; margin-top: 20px;'>TOTAL GENERAL DE LIQUIDACIÓN: $ {gran_total_consolidado:,.2f}</h3>
+                    <button class="btn-imprimir-html" onclick="window.print()">🖨️ Resumen Consolidado (Agrupado por Código)</button>
+                </div>
+                """)
+
+# -----------------------------------------------------------------------------
+# 💵 MÓDULO 2: FACTURACIÓN PARTICULARES (NUEVO)
+# -----------------------------------------------------------------------------
+elif menu == "💵 Facturación Particulares":
+    st.header("💵 Liquidación y Facturación de Particulares")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        f_desde_p = st.date_input("Fecha Desde:", value=date(date.today().year, date.today().month, 1), key="part_fecha_desde")
+    with col2:
+        f_hasta_p = st.date_input("Fecha Hasta:", value=date.today(), key="part_fecha_hasta")
+
+    todas_las_ordenes = buscar_ordenes_todas()
+    filas_particulares = []
+    gran_total_particular = 0.0
+
+    codigos_no_facturables = ['C/H', 'CNOH', 'IA', 'FGE']
+    codigos_hemograma = ['GR_01', 'HB_02', 'HT_03', 'VCM_04', 'HCM_05', 'CHCM_06', 'GB_07', 'NEU_08', 'EOS_09', 'BAS_10', 'LIN_11', 'MON_12', 'PLAQ_13']
+
+    for o in todas_las_ordenes:
+        estado_o = str(o[4]).strip().lower()
+        os_en_bd = str(o[8]).strip().lower() if o[8] is not None else ""
+        fecha_orden_str = str(o[1]).strip() if o[1] is not None else ""
+        
+        fecha_objeto = None
+        for formato in ('%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y'):
+            try:
+                fecha_objeto = datetime.strptime(fecha_orden_str, formato).date()
+                break
+            except ValueError:
+                continue
+        
+        if fecha_objeto is None or not (f_desde_p <= fecha_objeto <= f_hasta_p):
+            continue
+
+        if estado_o in ['validada', 'cerrada']:
+            items_o = obtener_items_para_cargar(o[0])
+            hemograma_procesado = False
+            
+            es_orden_particular = (os_en_bd == "particular")
+            
+            for item in items_o:
+                perf_c = str(item[1]).strip() if item[1] is not None else ""
+                cod_i = str(item[2]).strip() if item[2] is not None else ""
+                sub_i = str(item[3]).strip() if item[3] is not None else ""
+                ub_f = item[11]
+                val_particular = item[-1] if len(item) > 13 else 0
+                es_item_particular = val_particular in [1, '1', True, 'true', 'True']
+
+                codigo_limpio = cod_i.upper()
+                if codigo_limpio in codigos_no_facturables:
+                    continue
+
+                if es_orden_particular or es_item_particular:
+                    if perf_c == '475' or codigo_limpio in codigos_hemograma:
+                        if not hemograma_procesado:
+                            precio_item = 5.0 * 1000.0  # Ajustar multiplicador según tu valor de UB Particular
+                            gran_total_particular += precio_item
+                            filas_particulares.append({
+                                "Protocolo": o[10],
+                                "Paciente": o[2],
+                                "DNI": o[3],
+                                "Origen": "Orden Particular" if es_orden_particular else "Ítem Modificado",
+                                "Código": "475",
+                                "Práctica": "HEMOGRAMA COMPLETO",
+                                "Monto ($)": f"$ {precio_item:,.2f}"
+                            })
+                            hemograma_procesado = True
                     else:
-                        cod_resumen = str(cod_i).strip()
-                        nom_resumen = str(sub_i).strip().upper()
-                        ub_resumen = float(str(ub_f).replace(',', '.'))
+                        try:
+                            ub_num = float(str(ub_f).replace(',', '.')) if ub_f else 1.0
+                        except ValueError:
+                            ub_num = 1.0
+                        
+                        precio_item = ub_num * 1000.0  # Ajustar multiplicador según tu valor de UB Particular
+                        gran_total_particular += precio_item
+                        
+                        filas_particulares.append({
+                            "Protocolo": o[10],
+                            "Paciente": o[2],
+                            "DNI": o[3],
+                            "Origen": "Orden Particular" if es_orden_particular else "Ítem Modificado",
+                            "Código": cod_i,
+                            "Práctica": sub_i.upper(),
+                            "Monto ($)": f"$ {precio_item:,.2f}"
+                        })
 
-                    if cod_resumen not in mapa_consolidado:
-                        mapa_consolidado[cod_resumen] = {
-                            "Código": cod_resumen, "Práctica": nom_resumen,
-                            "U.B. Unit": ub_resumen, "Cantidad": 0, "Total U.B.": 0.0
-                        }
-                    
-                    mapa_consolidado[cod_resumen]["Cantidad"] += 1
-                    mapa_consolidado[cod_resumen]["Total U.B."] += ub_resumen
+    if not filas_particulares:
+        st.info("No se encontraron prácticas o ítems particulares en el período seleccionado.")
+    else:
+        st.success(f"📋 Se encontraron **{len(filas_particulares)}** ítems particulares para liquidar.")
+        
+        df_part = pd.DataFrame(filas_particulares)
+        html_tabla_part = df_part.to_html(index=False, classes='tabla-facturacion', border=1)
 
-                if tiene_analisis_facturables:
-                    if incluye_acto == 1: cant_actos += 1
-                    if incluye_gbi == 1: cant_gbis += 1
-
-            filas_consolidadas = []
-            for c_key, c_val in mapa_consolidado.items():
-                precio_acumulado = c_val["Total U.B."] * valor_ub_os_actual
-                gran_total_consolidado += precio_acumulado
-                filas_consolidadas.append({
-                    "Código": c_val["Código"], "Práctica": c_val["Práctica"],
-                    "U.B. Unit": c_val["U.B. Unit"], "Cantidad": c_val["Cantidad"],
-                    "Total U.B.": c_val["Total U.B."], "Subtotal ($)": f"$ {precio_acumulado:,.2f}"
-                })
-
-            if cant_actos > 0:
-                tot_acto_f = cant_actos * valor_acto
-                gran_total_consolidado += tot_acto_f
-                filas_consolidadas.append({
-                    "Código": "1", "Práctica": "ACTO BIOQUIMICO", "U.B. Unit": 6.0,
-                    "Cantidad": cant_actos, "Total U.B.": 6.0 * cant_actos, "Subtotal ($)": f"$ {tot_acto_f:,.2f}"
-                })
-            if cant_gbis > 0:
-                tot_gbi_f = cant_gbis * valor_gbi
-                gran_total_consolidado += tot_gbi_f
-                filas_consolidadas.append({
-                    "Código": "1002", "Práctica": "GBI - GESTION BIOQUIMICA INTEGRAL", "U.B. Unit": 0.0,
-                    "Cantidad": cant_gbis, "Total U.B.": 0.0, "Subtotal ($)": f"$ {tot_gbi_f:,.2f}"
-                })
-
-            df_consolidado = pd.DataFrame(filas_consolidadas) if filas_consolidadas else pd.DataFrame(columns=["Código", "Práctica", "U.B. Unit", "Cantidad", "Total U.B.", "Subtotal ($)"])
-            html_tabla_consolidado = df_consolidado.to_html(index=False, classes='tabla-facturacion', border=1)
-
+        clave_cont_part = f"cont_fact_part_{f_desde_p}_{f_hasta_p}"
+        
+        with st.container(key=clave_cont_part):
             st.html(f"""
             <div id="print-area">
                 <style>
                     .tabla-facturacion {{ width: 100%; border-collapse: collapse; font-family: Arial, sans-serif; margin-top: 15px; margin-bottom: 15px; }}
                     .tabla-facturacion th, .tabla-facturacion td {{ padding: 8px; text-align: left; border: 1px solid #ddd; color: black !important; }}
-                    .tabla-facturacion th {{ background-color: #e6f2ff; font-weight: bold; }}
+                    .tabla-facturacion th {{ background-color: #fff3cd; font-weight: bold; }}
+                    .btn-imprimir-html {{
+                        background-color: #d39e00; color: white; border: none; padding: 10px 20px;
+                        font-size: 16px; border-radius: 5px; cursor: pointer; width: 100%; margin-top: 10px;
+                    }}
+                    @media print {{
+                        .btn-imprimir-html {{ display: none; }}
+                    }}
                 </style>
-                <h3 style='text-align: center; color: black; margin-bottom:0;'>RESUMEN CONSOLIDADO DE LIQUIDACIÓN: {dict_os_f[os_f_sel]}</h3>
-                <p style='text-align: center; color: #333; margin-top:5px; margin-bottom:20px;'>Período: {f_desde.strftime('%d/%m/%Y')} al {f_hasta.strftime('%d/%m/%Y')} | Ámbito: {ambito_f}</p>
-                {html_tabla_consolidado}
-                <h3 style='color: black; margin-top: 20px;'>TOTAL GENERAL DE LIQUIDACIÓN: $ {gran_total_consolidado:,.2f}</h3>
+                <h3 style='text-align: center; color: black; margin-bottom:0;'>LIQUIDACIÓN DE PACIENTES PARTICULARES</h3>
+                <p style='text-align: center; color: #333; margin-top:5px; margin-bottom:20px;'>Período: {f_desde_p.strftime('%d/%m/%Y')} al {f_hasta_p.strftime('%d/%m/%Y')}</p>
+                {html_tabla_part}
+                <h3 style='color: black; margin-top: 20px;'>TOTAL PARTICULAR A COBRAR: $ {gran_total_particular:,.2f}</h3>
+                <button class="btn-imprimir-html" onclick="window.print()">🖨️ Imprimir Liquidación Particulares</button>
             </div>
             """)
-            
-            # 🖨️ BOTÓN DE IMPRESIÓN PARA DETALLE
-            st.button("🖨️ Resumen Consolidado (Agrupado por Código)", key="btn_print_detalle", use_container_width=True)
-            st.components.v1.html("""
-                <script>
-                    const buttons = window.parent.document.querySelectorAll('button');
-                    const printButton = Array.from(buttons).find(el => el.innerText.includes('Imprimir Detalle por Pacientes'));
-                    if (printButton) {
-                        printButton.onclick = function() {
-                            const printContents = window.parent.document.getElementById('print-area').innerHTML;
-                            const originalContents = window.parent.document.body.innerHTML;
-                            window.parent.print();
-                        };
-                    }
-                </script>
-            """, height=0)
-            
-# --- MÓDULO 6: CONFIGURACIÓN (AQUÍ ESTÁN LAS DOS GRANDES CORRECCIONES) ---
 elif menu == "⚙️ Configuración de Análisis":
     st.header("⚙️ Panel de Gestión de Archivos de Configuración")
     t_det, t_perf, t_os, t_med, t_resp, t_firmas = st.tabs(["🔬 Determinaciones", "🧬 Perfiles (Combos)", "💵 Seguros (UB)", "👨‍⚕️ Médicos", "✍ Respuestas Fijas", "✍️ Logos y Firmas"])
