@@ -1483,7 +1483,28 @@ elif menu == "✏️ Modificar Protocolos":
         estado_actual = str(o_estado).strip().lower()
         es_validado = "validad" in estado_actual or "firmad" in estado_actual
         
-        if es_validado_aa:  
+        # 1. Obtenemos el último ID de orden creado de forma segura si no está definido
+        if 'orden_id' not in locals() and 'orden_id' not in globals():
+            conn_id = conectar_db()
+            c_id = conn_id.cursor()
+            c_id.execute("SELECT MAX(id) FROM ordenes")
+            res_id = c_id.fetchone()
+            conn_id.close()
+            orden_id = res_id[0] if res_id and res_id[0] is not None else 1
+
+        # 2. Consultamos el estado real del protocolo usando ese ID
+        conn_est = conectar_db()
+        c_est = conn_est.cursor()
+        c_est.execute("SELECT estado FROM ordenes WHERE id = ?", (orden_id,))
+        res_estado = c_est.fetchone()
+        conn_est.close()
+        
+        # 3. Determinamos si está validado
+        estado_actual = res_estado[0] if res_estado and res_estado[0] else "Pendiente"
+        es_validado_aa = estado_actual.strip().lower() in ["validado", "cerrado", "firmado"]
+
+        # 4. Evaluamos la validación correctamente
+        if es_validado_aa:
             st.error("🛑 **Resultados Bloqueados:** Este protocolo ya se encuentra **VALIDADO**.")
             if st.button("🔓 Desvalidar Protocolo para Modificar", type="secondary", use_container_width=True, key=f"btn_desvalidar_{orden_id}"):
                 conn = conectar_db(); c = conn.cursor()
@@ -1496,8 +1517,15 @@ elif menu == "✏️ Modificar Protocolos":
         
         st.markdown("<br>", unsafe_allow_html=True)
         
-        if not items: 
-            st.info("Este protocolo se creó vacío.")
+        # 1. Obtenemos los ítems o determinaciones asociados a este protocolo de forma segura
+        try:
+            items = obtener_sub_items_de_practica(orden_id) # O la función que utilices para listar los ítems del protocolo
+        except:
+            items = []
+
+        # 2. Validamos correctamente si la lista está vacía
+        if not items:
+            st.info("Este protocolo se creó vacío.")       
         else:
             # 🚨 BLOQUE TEMPORAL DE DEPURACIÓN EN PANTALLA
             st.write(f"🔍 **Debug Paciente ID:** `{pac_id_sel}` | **Orden Actual ID:** `{orden_id}`")
