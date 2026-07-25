@@ -1433,19 +1433,11 @@ elif menu == "🛒 Carga de Protocolos":
                             print(f"Nota consulta protocolo: {e}")
                             num_protocolo_real = orden_id
 
-                        # 1. Primero leemos la fila mientras la conexión y el cursor siguen abiertos
-                        fila_proto = c.fetchone()
-                        num_protocolo_real = fila_proto[0] if fila_proto else orden_id
-
-                        cur.execute("SELECT MAX(id) FROM ordenes")
-                        fila_proto = cur.fetchone()
-                        num_protocolo_real = fila_proto[0] if fila_proto and fila_proto[0] is not None else orden_id
-
-                        # 1. Abrimos conexión y cursor local de forma segura
+                        # 1. Abrimos conexión y cursor de forma segura para obtener el ID real
                         conn_temp = conectar_db()
                         cur_temp = conn_temp.cursor()
                         
-                        # 2. Obtenemos el ID real de la orden recién creada desde la tabla ordenes
+                        # 2. Obtenemos el ID máximo (la última orden recién creada)
                         cur_temp.execute("SELECT MAX(id) FROM ordenes")
                         fila_proto = cur_temp.fetchone()
                         num_protocolo_real = fila_proto[0] if fila_proto and fila_proto[0] is not None else orden_id
