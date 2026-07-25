@@ -1820,7 +1820,21 @@ elif menu == "🧪 Área Analítica (Carga)":
         except Exception:
             pass
 
-        items = obtener_items_para_cargar(orden_id)
+        # Obtenemos y ordenamos de forma estricta los ítems analíticos de la base de datos
+        try:
+            conn_items = conectar_db()
+            cur_items = conn_items.cursor()
+            cur_items.execute("""
+                SELECT id, perfil_codigo, codigo_item, sub_item, unidad, valores_referencia, 
+                       resultado, es_titulo, formula, metodo, en_negrita, ub_facturacion, orden_visual, es_particular
+                FROM resultados_items 
+                WHERE orden_id = ?
+                ORDER BY orden_visual ASC, id ASC
+            """, (orden_id,))
+            items = cur_items.fetchall()
+            conn_items.close()
+        except Exception:
+            items = obtener_items_para_cargar(orden_id)
         
         try:
             items = sorted(items, key=lambda x: (int(x[12]) if x[12] is not None else 9999, x[0]))
