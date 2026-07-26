@@ -1525,7 +1525,7 @@ elif menu == "✏️ Modificar Protocolos":
 
         # 2. Validamos correctamente si la lista está vacía
         if not items:
-            st.info("Este protocolo se creó vacío.")       
+            st.info("Este protocolo se creó vacío.")
         else:
             # 🚨 BLOQUE TEMPORAL DE DEPURACIÓN EN PANTALLA
             st.write(f"🔍 **Debug Paciente ID:** `{pac_id_sel}` | **Orden Actual ID:** `{orden_id}`")
@@ -1614,8 +1614,11 @@ elif menu == "✏️ Modificar Protocolos":
             for item in items_actuales:
                 try:
                     perf_c_m = str(item[1]).strip() # Código del perfil (ej: '412')
-                    sub_i_m  = item[3]              # Nombre en la orden
+                    sub_i_m  = item[3]             # Nombre en la orden
                     es_tit_m = str(item[7]).strip().lower() # Título ('si' / 'no')
+                    
+                    # Verificamos si la columna de particular existe en la tupla (índice 13 aprox, o por seguridad)
+                    es_part_m = item[13] if len(item) > 13 else 0 
                     
                     if perf_c_m not in vistos_perfiles:
                         vistos_perfiles.add(perf_c_m)
@@ -1627,7 +1630,7 @@ elif menu == "✏️ Modificar Protocolos":
                         else:
                             nombre_perfil = f"Práctica Código {perf_c_m}"
                             
-                        perfiles_cargados.append((item[1], nombre_perfil))
+                        perfiles_cargados.append((item[1], nombre_perfil, bool(es_part_m)))
                 except Exception:
                     continue
             
@@ -1647,7 +1650,7 @@ elif menu == "✏️ Modificar Protocolos":
             if perfil_a_agregar:
                 codigos_en_lista = [p[0] for p in st.session_state.perfiles_editar]
                 if perfil_a_agregar[0] not in codigos_en_lista:
-                    st.session_state.perfiles_editar.append((perfil_a_agregar[0], perfil_a_agregar[1]))
+                    st.session_state.perfiles_editar.append((perfil_a_agregar[0], perfil_a_agregar[1], False))
                     st.rerun()
 
         st.markdown("<br>", unsafe_allow_html=True)
@@ -1656,11 +1659,27 @@ elif menu == "✏️ Modificar Protocolos":
             col_lista_m, col_botones_m = st.columns([0.75, 0.25])
             
             with col_lista_m:
+                st.write("📋 **Estructura y Orden del Protocolo:**")
+                # Mostramos cada práctica con su checkbox de "Paga Paciente (Particular)" al lado
+                nuevos_estados_particulares = []
+                for i, (p_id, p_nom, p_part) in enumerate(st.session_state.perfiles_editar):
+                    col_item_txt, col_item_chk = st.columns([0.65, 0.35])
+                    with col_item_txt:
+                        st.markdown(f"**{i+1}.** `({p_id})` — {p_nom.upper()}")
+                    with col_item_chk:
+                        chk_val = st.checkbox("💵 Paga Paciente (Particular)", value=p_part, key=f"chk_part_mod_{orden_id_mod}_{p_id}_{i}")
+                        nuevos_estados_particulares.append((p_id, p_nom, chk_val))
+                
+                # Actualizamos los valores de particular en el session state si cambian
+                if nuevos_estados_particulares != st.session_state.perfiles_editar:
+                    st.session_state.perfiles_editar = nuevos_estados_particulares
+
+                # Radio invisible o selector para elegir cuál mover con los botones
                 opciones_radio_m = range(len(st.session_state.perfiles_editar))
                 perfil_index_sel_m = st.radio(
-                    "📋 Estructura y Orden del Protocolo (Seleccione uno para mover o quitar):", 
+                    "Seleccione el índice de la práctica a mover o quitar:", 
                     options=opciones_radio_m,
-                    format_func=lambda i: f"({st.session_state.perfiles_editar[i][0]}) — {st.session_state.perfiles_editar[i][1].upper()}"
+                    format_func=lambda i: f"Mover/Quitar ítem N° {i+1}: ({st.session_state.perfiles_editar[i][0]})"
                 )
 
             with col_botones_m:
@@ -1688,9 +1707,7 @@ elif menu == "✏️ Modificar Protocolos":
             st.info("Este protocolo no tiene prácticas asignadas en este momento.")
 
         st.markdown("<br>", unsafe_allow_html=True)
-                
-
-        # 4. BOTÓN DE GUARDADO FINAL CON CÁLCULOS AUTOMÁTICOS (VCM, HCM, CHCM)
+            
         # 4. BOTÓN DE GUARDADO FINAL Y RECALCULO DE ORDEN VISUAL (ESTABLE)
         if st.button("💾 Guardar Estructura y Orden de Prácticas", type="primary", use_container_width=True, key=f"btn_save_practicas_{orden_id_mod}", disabled=es_validado):
             if not st.session_state.perfiles_editar:
@@ -1705,10 +1722,11 @@ elif menu == "✏️ Modificar Protocolos":
                 # 2. Limpiamos las filas para reacomodar el orden visual
                 c.execute("DELETE FROM resultados_items WHERE orden_id = ?", (orden_id_mod,))
                 
-                # 3. Reinyectamos las prácticas en el nuevo orden respetando los resultados
+                # 3. Reinyectamos las prácticas en el nuevo orden estricto de la lista y guardando el flag particular
                 orden_del_perfil = 1
-                for perf_id, _ in st.session_state.perfiles_editar:
+                for perf_id, _, es_particular_bool in st.session_state.perfiles_editar:
                     sub_items = obtener_sub_items_de_practica(perf_id)
+                    val_part_int = 1 if es_particular_bool else 0
                     
                     for _, c_item, s_nombre, s_uni, s_ref, s_tit, s_form, s_ord, s_met, s_neg, s_ub_fac in sub_items:
                         codigo_limpio = str(c_item).strip()
@@ -1720,19 +1738,19 @@ elif menu == "✏️ Modificar Protocolos":
                             
                         orden_visual_calculado = (orden_del_perfil * 100) + num_orden_interno
                         
-                        # Recuperamos el resultado exacto que ya estaba guardado (así sea el calculado automáticamente por tu otra pantalla)
+                        # Recuperamos el resultado exacto que ya estaba guardado
                         resultado_a_preservar = valores_cargados_previamente.get(codigo_limpio, '')
                         
                         c.execute("""
                             INSERT INTO resultados_items (
                                 orden_id, codigo_perfil, codigo_item, sub_item, resultado, 
                                 unidad, valores_referencia, es_titulo, formula, orden_visual, 
-                                metodo, en_negrita, ub_facturacion
+                                metodo, en_negrita, ub_facturacion, es_particular
                             ) 
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
                             orden_id_mod, perf_id, c_item, s_nombre, resultado_a_preservar, s_uni, 
-                            s_ref, s_tit, s_form, orden_visual_calculado, s_met, s_neg, s_ub_fac
+                            s_ref, s_tit, s_form, orden_visual_calculado, s_met, s_neg, s_ub_fac, val_part_int
                         ))
                     
                     orden_del_perfil += 1
@@ -1750,31 +1768,13 @@ elif menu == "✏️ Modificar Protocolos":
         st.subheader("🚨 Zona de Peligro")
         st.write("Si necesitás anular por completo este protocolo del sistema, utilizá esta opción. Esta acción no se puede deshacer.")
         
-        # Usamos un checkbox como primer filtro de seguridad para que no lo presionen por error
         confirmar_bloqueo = st.checkbox(f"Habilitar botón para eliminar el Protocolo N° {o_proto}", key=f"chk_del_{orden_id_mod}")
         
         if confirmar_bloqueo:
-            # Si tildan el checkbox, se muestra el botón rojo de eliminación definitiva
             if st.button(f"💥 ELIMINAR PROTOCOLO N° {o_proto} DE FORMA DEFINITIVA", type="primary", use_container_width=True, key=f"btn_del_def_{orden_id_mod}"):
-                
-                # Ejecutamos la función de borrado
                 eliminar_protocolo_completo(orden_id_mod)
-                
-                # Mostramos mensaje de éxito, limpiamos pantalla y reiniciamos la app
                 st.success(f"El Protocolo N° {o_proto} ha sido eliminado por completo del sistema.")
                 st.rerun()
-
-import sqlite3
-import streamlit as st
-
-# ... (tus otras importaciones y funciones de base de datos)
-
-# 1. Configuración de tu menú (por ejemplo, en la barra lateral)
-
-
-# 2. Estructura de control condicional (Aquí es donde se organiza el IF/ELIF)
-if menu == "Inicio":
-    st.write("Bienvenidos al sistema")
 
 elif menu == "🧪 Área Analítica (Carga)":
     st.header("🧪 Carga Técnica de Resultados Analíticos")
