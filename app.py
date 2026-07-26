@@ -865,6 +865,27 @@ with st.sidebar:
             use_container_width=True,
             help="Haz clic para descargar una copia de seguridad local de la base de datos."
         )
+        st.markdown("---")
+        st.subheader("🔄 Restaurar Copia de Seguridad")
+        st.write("Sube tu archivo de respaldo (`.db`) para reemplazar la base de datos actual.")
+        
+        # Componente para subir el archivo .db
+        archivo_subido = st.file_uploader("Selecciona el archivo de backup (.db)", type=["db"], key="uploader_backup_db")
+        
+        if archivo_subido is not None:
+            # Botón de confirmación para evitar reemplazos accidentales
+            if st.button("⚠️ Confirmar y Restaurar Base de Datos", type="primary"):
+                try:
+                    # Usamos la misma variable 'db_path' que ya tienes definida en tu sistema
+                    with open(db_path, "wb") as f:
+                        f.write(archivo_subido.getbuffer())
+                        
+                    st.success("¡Base de datos restaurada con éxito! Recargando el sistema...")
+                    import time
+                    time.sleep(1.5)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error al restaurar la base de datos: {e}")
     else:
         st.warning("⚠️ No se encontró la base de datos activa.")
 
